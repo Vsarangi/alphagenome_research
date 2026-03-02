@@ -393,6 +393,7 @@ class AlphaGenomeModel(dna_model.DnaModel):
             splice_site_threshold=splice_site_threshold,
         )
     )
+    self._apply_fn_raw = jax.jit(apply_fn)
 
     # Metadata for each organism without padding.
     self._output_metadata_by_organism = {}
@@ -476,7 +477,36 @@ class AlphaGenomeModel(dna_model.DnaModel):
       return extractor
     else:
       raise ValueError(f'FastaExtractor not found for {organism.name=}')
+  
+  ## the following method is added for testing and exploration purposes, and is not part of the DnaModel interface: Added by Vivek
+  def predict_embeddings(
+    self,
+    sequence: str,
+    *,
+    organism: dna_model.Organism = dna_model.Organism.HOMO_SAPIENS,
+    transfer_to_host: bool = True,
+    ) -> np.ndarray | jax.Array:
+    """Return the model's internal trunk embeddings ('embeddings_1bp')."""
+    with self._device_context as device, jax.transfer_guard("disallow"):
+        organism_index = jax.device_put(
+            np.full((1,), convert_to_organism_index(organism), dtype=np.int32),
+            device,
+        )
+    x = jax.device_put(
+        np.asarray(self._one_hot_encoder.encode(sequence))[np.newaxis],
+        device,
+        )
+    full_preds = self._apply_fn_raw(self._params, self._state, x, organism_index)
+    emb_bsd = full_preds["embeddings_1bp"]  # (1, S, D) ON DEVICE
 
+    # OUTSIDE transfer_guard('disallow') now
+    if transfer_to_host:
+        emb_host = np.asarray(jax.device_get(emb_bsd))  # (1, S, D) on CPU
+        return emb_host[0]  # (S, D) on CPU
+
+    # caller wants device array
+    return emb_bsd  # keep (1, S, D) to avoid any indexing issues
+  
   def predict_sequence(
       self,
       sequence: str,
@@ -739,6 +769,8 @@ class AlphaGenomeModel(dna_model.DnaModel):
         results.append(result)
 
     return results
+  
+  
 
   def score_variant(
       self,
@@ -939,7 +971,7 @@ def _construct_output_from_predictions(
         metadata=track_metadata[track_masks[output_type]],
         interval=interval,
     )
-
+  
   def _convert_to_junction_data() -> junction_data.JunctionData | None:
     """Returns a splice junction prediction."""
     output_type = dna_output.OutputType.SPLICE_JUNCTIONS
@@ -998,7 +1030,7 @@ def convert_to_organism_index(
       return 1
     case _:
       raise ValueError(f'Unsupported organism: {organism}')
-
+    
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class ModelSettings:
